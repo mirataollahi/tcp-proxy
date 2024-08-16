@@ -1,0 +1,12 @@
+{
+    "name": "php/proxy-server",
+    "description": "PHP High-Performance tcp packet forwarder",
+    "autoload": {
+        "psr-4": {
+            "App\\": "../app/"
+        }
+    },
+    "require": {
+        "ext-swoole": "*"
+    }
+}
