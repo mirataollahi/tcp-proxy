@@ -18,13 +18,13 @@ return [
     /** Master tcp server configs */
     'server' => [
         'host' => '0.0.0.0',
-        'port' => 7000
+        'port' => 8033
     ],
 
 
     /** Target tcp server . packet forwarded to this server */
     'target' => [
         'host' => '192.168.66.62',
-        'port' => 7001,
+        'port' => 80,
     ],
 ];

@@ -191,8 +191,7 @@ class AppContext
      */
     public function onReceive(Server $server, int $fd, int $reactorId, string $data): void
     {
-        $this->logger->success("[TCP Server]  [Event Receive] => Received data from client  #$fd");
-
+        // $this->logger->success("[TCP Server]  [Event Receive] => Received data from client  #$fd");
         if (array_key_exists($fd, $this->clients)) {
             try {
                 /** @var TCPClient $tcpClient */

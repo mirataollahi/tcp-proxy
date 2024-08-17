@@ -10,7 +10,6 @@ use Swoole\Client;
 use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Server;
-use Swoole\Timer;
 use Throwable;
 
 class TCPClient
@@ -57,20 +56,27 @@ class TCPClient
      */
     public Channel $tcpClientPacketsQueue;
 
+
+    /**
+     * incoming messages from target tcp connection waiting to sent to client connection
+     */
+    public Channel $tcpTargetPacketsQueue;
+
     /**
      * @var int Create a coroutine and listen to incoming packets from tcp client connection to queue incoming packets
      */
     public int $clientPacketReceiverCid;
 
     /**
-     * @var bool When first packet from target tcp connection received , the property change to true
+     * @var int Target tcp connection packets incoming queue coroutine id
      */
-    public bool $targetStreamStarted = false;
+    public int $targetPacketsQueueReceiverId;
+
 
     /**
-     * @var int|null Last tcp packet received at this timestamp from target tcp connection
+     * @var float|null Last tcp packet received at this timestamp from target tcp connection
      */
-    public ?int $lastTargetPacketReceivedAt = null;
+    public ?float $lastTargetPacketReceivedAt = null;
 
     /**
      * @var int Heartbeat coroutine id
@@ -87,12 +93,19 @@ class TCPClient
     {
         $this->connectedAt = microtime(true);
         $this->logger = new Logger();
-        $this->tcpClientPacketsQueue = new Channel(100);
+        $this->tcpClientPacketsQueue = new Channel(200);
+        $this->tcpTargetPacketsQueue = new Channel(200);
         $this->logger->success("[Client $fd] [Initialize] => Initializing instance ....");
         $this->appContext = $app;
         $this->masterServer = $app->masterServer;
         $this->fd = $fd;
         $this->targetClient = new Client(SWOOLE_SOCK_TCP);
+        $this->targetClient->set([
+            'timeout'         => 1.5,
+            'connect_timeout' => 2,
+            'write_timeout'   => 1.5,
+            'read_timeout'    => 1.5,
+        ]);
         $this->logger->info("[Client $this->fd] [Initialize] => Connection to target tcp server ....");
 
         if (!$this->targetClient->connect($host, $port, 2)) {
@@ -110,6 +123,9 @@ class TCPClient
 
             /** Create tcp client packet receiver */
             $this->createTcpClientPacketReceiver();
+
+            /** Create target tcp connection packets queue listener */
+            $this->createTargetPacketsQueueReceiver();
         }
     }
 
@@ -136,7 +152,7 @@ class TCPClient
     {
         try {
             $packetLen = strlen($packet);
-            $this->logger->info("[Client $this->fd] [On Receive Packet TCP Client] => Forwarded to target connection with length $packetLen");
+            $this->logger->info("[Client $this->fd] [On Receive Packet TCP Client] => Client Packet =====>>> Target Connection   (len : $packetLen)");
             $this->sendPacketToTarget($packet);
         } catch (Throwable $exception) {
             $this->logger->error("[[Client $this->fd] [On Receive Packet TCP Client] [Error] => Forward to target error {$exception->getMessage()}");
@@ -150,7 +166,7 @@ class TCPClient
     {
         $packetLen = strlen($packet);
         $this->appContext->masterServer->send($this->fd, $packet);
-        $this->logger->info("[Client $this->fd] [On Receive Packet Target] => forwarded to client connection with length $packetLen");
+        $this->logger->info("[Client $this->fd] [On Receive Packet Target] =>  Target Packet =====>>> Client Connection   (len : $packetLen)");
     }
 
     /**
@@ -159,25 +175,29 @@ class TCPClient
     public function createTargetPacketReceiver(): void
     {
         $this->targetPacketReceiverCid = Coroutine::create(function () {
-            $this->logger->success("[Client $this->fd] [Target Packet Receiver] => Starting target packet receiver ... ");
+            $this->logger->success("[Client $this->fd] [Target Packet Receiver] => 👷 Starting target packet receiver Coroutine ... ");
             while (!$this->isFree) {
                 try {
                     $packet = $this->targetClient->recv();
                     if ($packet) {
                         Coroutine::create(function () use ($packet) {
                             $this->lastTargetPacketReceivedAt = microtime(true);
-                            $this->onReceiveFromTarget($packet);
+                            $this->tcpTargetPacketsQueue->push($packet);
                         });
-                    }
-                    /** Break target connection if socket stream have non-normal error message */
-                    else if ($this->targetClient->errCode !== SOCKET_ETIMEDOUT && $this->targetClient->errCode !== 0) {
-                        $this->logger->info("[Client $this->fd] [Target Packet Receiver] => stopping because received target connection gracefully closed");
+                    } /** Break target connection if socket stream have non-normal error message */
+                    else if (
+                        $this->targetClient->errCode !== SOCKET_ETIMEDOUT &&
+                        $this->targetClient->errCode !== SOCKET_EWOULDBLOCK &&
+                        $this->targetClient->errCode !== 0
+                    ) {
+                        $this->logger->info("[Client $this->fd] [Target Packet Receiver] => stopping because received target connection gracefully closed (errorCode => {$this->targetClient->errCode})");
                         $this->free();
                         break;
                     }
                 } catch (Throwable $exception) {
                     $this->logger->error("[Client $this->fd] [Target Packet Receiver] [Error] => target receiver error {$exception->getMessage()}");
                 }
+                Coroutine::sleep(0.2);
             }
             $this->logger->info("[Client $this->fd] [Target Packet Receiver]  => Target packet receiver stopped");
         });
@@ -189,15 +209,33 @@ class TCPClient
     public function createTcpClientPacketReceiver(): void
     {
         $this->clientPacketReceiverCid = Coroutine::create(function () {
-            $this->logger->success("[Client $this->fd] [TCP Packet Receiver] => Starting TCP client packet receiver coroutine ... ");
+            $this->logger->success("[Client $this->fd] [TCP Packet Receiver] => 👷 Starting TCP client packet receiver coroutine ... ");
             while (!$this->isFree) {
                 $packet = $this->tcpClientPacketsQueue->pop(1);
                 if ($packet) {
-                    $this->logger->success("[Client $this->fd] [TCP Packet Receiver] => Tcp client packet receiver successfully received new packet");
                     $this->onReceiveFromClient($packet);
                 }
+                Coroutine::sleep(0.2);
             }
             $this->logger->info("[Client $this->fd] [TCP Packet Receiver] [Stopped] => TCP client packet listener stopped");
+        });
+    }
+
+    /**
+     * @return void Create a coroutine and listen to incoming packets from target tcp connection
+     */
+    public function createTargetPacketsQueueReceiver(): void
+    {
+        $this->targetPacketsQueueReceiverId = Coroutine::create(function () {
+            $this->logger->success("[Client $this->fd] [Target Queue Listener] => 👷 Starting target connection packets queue listener ... ");
+            while (!$this->isFree) {
+                $packet = $this->tcpTargetPacketsQueue->pop(1);
+                if ($packet) {
+                    $this->onReceiveFromTarget($packet);
+                }
+                Coroutine::sleep(0.2);
+            }
+            $this->logger->info("[Client $this->fd] [Target Queue Listener] [Stopped] => Target packets queue listener stopped");
         });
     }
 
@@ -221,7 +259,14 @@ class TCPClient
         $this->closeTargetPacketReceiverCoroutine();
         /** Close Heartbeat and health checker coroutine */
         $this->closeHeartbeatCoroutine();
-        $this->logger->info("[Client $this->fd] [Freeing] [Finished] => Free and close process finished");
+
+        try {
+            $this->tcpTargetPacketsQueue->close();
+            $this->tcpClientPacketsQueue->close();
+        }
+        catch (Throwable $exception){}
+
+        $this->logger->info("[Client $this->fd] [Freeing] [Finished] => 🖐 Finished (free)");
     }
 
     /**
@@ -299,9 +344,9 @@ class TCPClient
      */
     public function createHeartbeat(): void
     {
-        $this->logger->info("[Client #$this->fd] [Heartbeat] => Create heartbeat coroutine ... ");
+        $this->logger->info("[Client #$this->fd] [Heartbeat] => 🩺 Create heartbeat coroutine ... ");
         $this->heartbeatCid = Coroutine::create(function () {
-            while (!$this->isFree){
+            while (!$this->isFree) {
                 $aliveDuration = microtime(true) - $this->connectedAt;
 
                 /** Wait client target and client connection starting up */
@@ -330,14 +375,12 @@ class TCPClient
                     : null;
 
                 /** Free up client if last packet from target received is null*/
-                if (is_null($lastTargetPacketDuration)){
+                if (is_null($lastTargetPacketDuration)) {
                     $this->logger->info("[Client #$this->fd] [Heartbeat] => Start freeing client because do not received target packet");
                     $this->free();
                     break;
-                }
-
-                /** Free up client if last packet from target received more than 1.7 second*/
-                else if ($lastTargetPacketDuration >= 2){
+                } /** Free up client if last packet from target received more than 1.7 second*/
+                else if ($lastTargetPacketDuration >= 2) {
                     $this->logger->info("[Client #$this->fd] [Heartbeat] => Start freeing client because last target packet received $lastTargetPacketDuration seconds ago");
                     $this->free();
                     break;
